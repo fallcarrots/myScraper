@@ -154,6 +154,32 @@ class AppConfig(BaseModel):
     #: 输出格式。
     output: OutputSettings = Field(default_factory=OutputSettings)
 
+    @model_validator(mode="before")
+    @classmethod
+    def _derive_global_rate_limit(cls, data: object) -> object:
+        """未显式配置 global_rate_limit 时，按并发数派生默认值。
+
+        理由：全局限速的槽位按「预约」记账，瞬时突发上界等于并发数，
+        因此默认值取 ``max(DEFAULT_GLOBAL_RATE_LIMIT, max_concurrency)``。
+        若用户**显式**配置了更严格或更宽松的值，一律尊重，不做改写——
+        覆盖用户的更严格设置会让我们比用户要求的更激进。
+        """
+        if not isinstance(data, dict):
+            return data
+        merged: dict[str, object] = dict(data)
+        rate_limit = merged.get("rate_limit")
+        rl: dict[str, object] = dict(rate_limit) if isinstance(rate_limit, dict) else {}
+        if "global_rate_limit" in rl:
+            return merged  # 显式提供 → 原样交给字段校验
+        raw = merged.get("max_concurrency", DEFAULT_MAX_CONCURRENCY)
+        if not isinstance(raw, (int, float)) or isinstance(raw, bool):
+            return merged
+        rl["global_rate_limit"] = min(
+            max(DEFAULT_GLOBAL_RATE_LIMIT, float(raw)), MAX_GLOBAL_RATE_LIMIT
+        )
+        merged["rate_limit"] = rl
+        return merged
+
 
 def default_config() -> AppConfig:
     """返回默认应用配置。"""

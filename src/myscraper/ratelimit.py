@@ -158,3 +158,11 @@ class HostRateLimiter:
                 self._next_g = max(self._next_g, now) + self._step_g
         if delay > 0:
             await self._clock.sleep(delay)  # 锁外只 sleep 一次
+
+    @property
+    def next_global_at(self) -> float | None:
+        """当前全局槽游标（单调时钟秒）；未启用全局限速时为 None。
+
+        仅用于诊断与回归断言，不参与限速计算。
+        """
+        return self._next_g if self._step_g > 0.0 else None

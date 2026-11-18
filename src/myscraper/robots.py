@@ -20,6 +20,7 @@ from urllib.robotparser import RobotFileParser
 import httpx
 
 from .clock import Clock
+from .ratelimit import HostRateLimiter
 
 __all__ = [
     "MAX_ROBOTS_BYTES",
@@ -131,19 +132,23 @@ class RobotsCache:
         *,
         ttl_s: float = 3600.0,
         max_crawl_delay_s: float = 30.0,
+        limiter: HostRateLimiter | None = None,
     ) -> None:
         """初始化缓存。
 
         Args:
-            client: 用于拉取 robots.txt 的 httpx 异步客户端（超时/限速由调用方管辖）。
+            client: 用于拉取 robots.txt 的 httpx 异步客户端（超时由调用方管辖）。
             clock: 注入的时钟，用于 TTL 判定。
             ttl_s: 缓存条目存活秒数。
             max_crawl_delay_s: 可接受的 Crawl-delay 上限；超出即判为不可抓。
+            limiter: 传入 limiter 时 robots.txt 请求会先取该 host 的令牌
+                （计入全局速率）；为 None 表示不限速（仅测试用，生产装配必须传入）。
         """
         self._client = client
         self._clock = clock
         self._ttl_s = ttl_s
         self._max_crawl_delay_s = max_crawl_delay_s
+        self._limiter = limiter
         self._entries: dict[str, tuple[asyncio.Task[_OriginRules], float]] = {}
 
     async def verdict_for(self, url: str) -> RobotsVerdict:
@@ -189,6 +194,10 @@ class RobotsCache:
         """
         # 局部导入以避免 http↔robots 循环依赖（http.py 顶部 import 了 RobotsCache）。
         from .http import read_capped
+
+        # robots.txt 也是真实请求：先取该 host 令牌，计入限速（None 时不限速，仅测试）。
+        if self._limiter is not None:
+            await self._limiter.acquire(urlsplit(origin).netloc)
 
         try:
             request = self._client.build_request("GET", origin + ROBOTS_PATH)

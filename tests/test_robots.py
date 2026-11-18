@@ -9,6 +9,7 @@ import httpx
 import pytest
 from fakes import FakeClock
 
+from myscraper.ratelimit import HostRateLimiter
 from myscraper.robots import (
     PRODUCT_TOKEN,
     RobotsCache,
@@ -184,3 +185,27 @@ async def test_cache_distinct_origins_fetched_separately() -> None:
     assert len(calls) == 2
     assert first.source == "robots"
     assert second.source == "robots"
+
+
+async def test_robots_request_consumes_rate_limit_slot() -> None:
+    """robots.txt 请求必须经过限速器：两个不同 origin 的第二次拉取要等待。"""
+    calls: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(1)
+        return httpx.Response(200, text="User-agent: *\nAllow: /\n")
+
+    client = make_client(handler)
+    clock = FakeClock()
+    limiter = HostRateLimiter(
+        clock,
+        rate_limit_per_host=1000.0,
+        min_request_interval=0.0,
+        global_rate_limit=1.0,
+    )
+    cache = RobotsCache(client, FakeClock(), limiter=limiter)
+    async with client:
+        await cache.verdict_for("https://a.example/x")
+        await cache.verdict_for("https://b.example/y")
+    assert len(calls) == 2
+    assert any(sleep == pytest.approx(1.0) for sleep in clock.sleeps)

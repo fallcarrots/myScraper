@@ -56,13 +56,19 @@ def crawl_cmd(
     try:
         cfg = load_config(config_file)
         updates: dict[str, object] = {}
+        rl_updates: dict[str, object] = {}
+        if concurrency is not None:
+            # 全局槽按预约记账，突发上界等于并发数：CLI 抬高并发时同步抬高全局限速，
+            # 避免瞬时聚合速率突破 global_rate_limit。用户已配置的更高值不受影响。
+            rl_updates["global_rate_limit"] = max(
+                cfg.rate_limit.global_rate_limit, float(concurrency)
+            )
+        if rate_limit is not None:
+            rl_updates["rate_limit_per_host"] = rate_limit
         if concurrency is not None:
             updates["max_concurrency"] = concurrency
-        if rate_limit is not None:
-            updates["rate_limit"] = {
-                **cfg.rate_limit.model_dump(),
-                "rate_limit_per_host": rate_limit,
-            }
+        if rl_updates:
+            updates["rate_limit"] = {**cfg.rate_limit.model_dump(), **rl_updates}
         if max_retries is not None:
             updates["retry"] = {**cfg.retry.model_dump(), "max_retries": max_retries}
         if fmt is not None:

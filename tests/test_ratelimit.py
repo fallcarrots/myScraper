@@ -1,6 +1,7 @@
 """ratelimit 模块测试：compute_interval 限速公式 + HostRateLimiter 预约式等待。"""
 
 import asyncio
+from datetime import UTC, datetime
 
 import pytest
 from fakes import FakeClock
@@ -149,9 +150,25 @@ async def test_crawl_delay_is_sticky_per_host() -> None:
     assert clock.sleeps == [pytest.approx(2.0)]
 
 
+class _FrozenClock:
+    """sleep 只记录、不推进时间：让所有预约落在同一 now，直接暴露游标推进量。"""
+
+    def __init__(self) -> None:
+        self.sleeps: list[float] = []
+
+    def now(self) -> datetime:
+        return datetime(2026, 1, 1, tzinfo=UTC)
+
+    def monotonic(self) -> float:
+        return 0.0
+
+    async def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+
+
 async def test_slow_host_does_not_push_global_cursor() -> None:
-    """慢 host 的等待不得后移全局游标，否则其它 host 会被饿死。"""
-    clock = FakeClock()
+    """慢 host 的多次预约不得把全局游标推到 N*host_step（旧实现为 181，新实现为 4）。"""
+    clock = _FrozenClock()
     limiter = HostRateLimiter(
         clock,
         rate_limit_per_host=1 / 60,
@@ -159,11 +176,7 @@ async def test_slow_host_does_not_push_global_cursor() -> None:
         global_rate_limit=1.0,
     )
     await asyncio.gather(*(limiter.acquire("slow.example", crawl_delay=None) for _ in range(4)))
-    # 慢 host 自身按 60s 步长等待（4 次 → 虚拟时间约 180s），但全局游标按"占用"
-    # 只推进到 ~4s。用另一 host 探测：若游标被慢 host 推到 ~180s，这里会额外等 ~60s。
-    before = clock.monotonic()
-    await limiter.acquire("other.example", crawl_delay=None)
-    assert clock.monotonic() - before <= 5.0
+    assert limiter.next_global_at == pytest.approx(4.0)
 
 
 async def test_host_is_case_insensitive() -> None:

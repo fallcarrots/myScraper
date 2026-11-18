@@ -182,7 +182,6 @@ async def _run_crawl(
             try:
                 outcome = await fetcher.fetch(url)
                 record = _to_record(outcome, clk, plan, cfg)
-                prog.advance(record)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -195,6 +194,8 @@ async def _run_crawl(
                     status="failed",
                     error=f"worker/{type(exc).__name__}",
                 )
+            with suppress(Exception):
+                prog.advance(record)  # UI 异常不得影响记录与统计
             await results.put(record)
             if record.status == "ok":
                 ok += 1
@@ -248,6 +249,8 @@ async def _run_crawl(
             clk,
             ttl_s=cfg.robots.cache_ttl_s,
             max_crawl_delay_s=cfg.robots.max_crawl_delay_s,
+            # robots.txt 请求同样计入限速（per-host + 全局兜底）。
+            limiter=limiter,
         )
         fetcher = HttpFetcher(
             http,
