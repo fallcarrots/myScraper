@@ -1,0 +1,111 @@
+# ==============================================================
+# Python + uv 爬虫项目 .gitignore
+#
+# 注意：下面这些文件是「有意提交」的，请不要加进忽略列表：
+#   uv.lock          依赖锁定文件，保证团队/CI 装到同一套版本
+#   .python-version  固定解释器版本（uv 会读取）
+#   pyproject.toml / src / tests / .github
+# ==============================================================
+
+# ---------- 虚拟环境 ----------
+.venv/
+venv/
+.virtualenv/
+.conda/
+
+# ---------- 字节码 / 构建产物 ----------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.pyd
+*.egg
+*.egg-info/
+.eggs/
+build/
+dist/
+sdist/
+wheels/
+*.whl
+pip-wheel-metadata/
+.installed.cfg
+
+# ---------- 测试 / 覆盖率 / 类型检查缓存 ----------
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.dmypy.json
+dmypy.json
+.tox/
+.nox/
+.coverage
+.coverage.*
+coverage.xml
+coverage.json
+htmlcov/
+junit.xml
+.benchmarks/
+.ipynb_checkpoints/
+
+# ---------- 爬虫运行时产物（本地生成，全部忽略） ----------
+# 日志
+/logs/
+*.log
+*.log.*
+
+# 抓取结果 / 原始数据 / 导出 / 下载 / 快照 / 缓存
+/data/
+/raw/
+/output/
+/out/
+/exports/
+/downloads/
+/snapshots/
+/cache/
+/.cache/
+/.scrapy/
+
+# 结构化结果与数据库文件
+*.sqlite
+*.sqlite3
+*.db
+*.jsonl
+*.ndjson
+*.parquet
+*.har
+
+# 断点续爬 / 会话状态
+*.ckpt
+/state/
+
+# ---------- 环境变量与凭据 ----------
+.env
+.env.*
+!.env.example
+!.env.template
+.netrc
+cookies.txt
+*.cookies
+
+# ---------- 编辑器 / 系统文件 ----------
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+!.vscode/launch.json
+.idea/
+*.iml
+.history/
+*.swp
+*.swo
+*~
+.orig/
+*.orig
+*.rej
+
+.DS_Store
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+desktop.ini
+.directory
