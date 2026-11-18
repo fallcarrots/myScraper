@@ -87,9 +87,15 @@ def crawl_cmd(
         raise typer.Exit(_config_error_exit(f"输入错误: {exc}")) from exc
 
     ua = build_user_agent(__version__, "https://github.com/fallcarrots/myScraper")
-    options = RunOptions(fmt=fmt if fmt is not None else "jsonl", out=output)
+    options = RunOptions(fmt=cfg.output.format, out=output)
     stats = asyncio.run(crawl(cfg, urls, options, user_agent=ua))
+    if stats.write_errors:
+        typer.echo(f"写出失败 {stats.write_errors} 条，输出不完整", err=True)
+        raise typer.Exit(int(ExitCode.INTERNAL))
     code = decide_exit_code(total=stats.total, succeeded=stats.ok, aborted=stats.aborted)
+    if code == int(ExitCode.CONFIG) and stats.skipped > 0:
+        # 全部因 robots 合规跳过不是配置错误：合规跳过视为正常收尾。
+        code = int(ExitCode.OK)
     if code != int(ExitCode.OK):
         typer.echo(
             f"汇总: 尝试 {stats.total}，成功 {stats.ok}，失败 {stats.failed}，"
@@ -120,6 +126,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     except KeyboardInterrupt:
         typer.echo("已中断", err=True)
         return 130
+    except typer.Abort:
+        typer.echo("已中断", err=True)
+        return 1
     except Exception as exc:
         typer.echo(f"内部错误: {type(exc).__name__}: {exc}", err=True)
         return int(ExitCode.INTERNAL)

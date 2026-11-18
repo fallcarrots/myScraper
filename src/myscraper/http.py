@@ -142,7 +142,7 @@ class HttpFetcher:
         self._max_html_bytes = max_html_bytes
 
     async def fetch(self, url: str) -> FetchOutcome:
-        """抓取单个 URL，返回 `FetchOutcome`（绝不抛出网络/robots 异常）。
+        """抓取单个 URL，返回 `FetchOutcome`（绝不抛出网络/robots 异常，含 InvalidURL）。
 
         Args:
             url: 原始请求 URL。
@@ -173,8 +173,9 @@ class HttpFetcher:
 
             try:
                 resp = await self._client.get(url)
-            except httpx.HTTPError as exc:
-                # 2a) 网络层失败：可重试则按策略退避后继续，否则终局失败。
+            except (httpx.HTTPError, httpx.InvalidURL) as exc:
+                # 2a) 网络层失败（含构造 Request 时同步抛出的 InvalidURL，
+                #     它不继承 HTTPError）：可重试则按策略退避后继续，否则终局失败。
                 if should_retry(
                     "GET",
                     status_code=None,

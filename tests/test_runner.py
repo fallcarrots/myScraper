@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Final
 
 import httpx
+import pytest
 from fakes import FakeClock
 
 from myscraper.config import (
@@ -23,6 +24,8 @@ from myscraper.config import (
     RetrySettings,
     default_config,
 )
+from myscraper.errors import ConfigError
+from myscraper.http import build_client
 from myscraper.models import PageRecord
 from myscraper.output import JsonlWriter
 from myscraper.progress import NullProgress
@@ -79,6 +82,18 @@ class _CountingTransport(httpx.AsyncBaseTransport):
             await asyncio.sleep(0)
         finally:
             self._counter.active -= 1
+        return httpx.Response(200, text=PAGE_HTML)
+
+
+class _InvalidURLTransport(httpx.AsyncBaseTransport):
+    """按路径模拟 InvalidURL：/bad* 抛 httpx.InvalidURL，robots 放行，其余 200。"""
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/robots.txt":
+            return httpx.Response(200, text=ROBOTS_ALLOW_ALL)
+        if path.startswith("/bad"):
+            raise httpx.InvalidURL("simulated invalid url")
         return httpx.Response(200, text=PAGE_HTML)
 
 
@@ -438,3 +453,71 @@ async def test_worker_count_independent_of_host_count() -> None:
         await client.aclose()
     assert stats.ok == 20
     assert counter.peak <= 2, f"在途请求峰值 {counter.peak} 超过并发上限 2"
+
+
+# ---------- 12. 坏 URL 隔离（防死锁回归） ----------
+
+
+async def test_bad_urls_are_isolated_not_deadlocking() -> None:
+    """抛 InvalidURL 的 URL 不得让 worker 死亡 / 队列死锁，且不影响正常 URL。
+
+    注意：不能靠非法端口（如 :99999）触发 InvalidURL——httpx.MockTransport
+    不会对 URL 做端口/合法性校验，请求会直接进 handler 并返回 200，根本不抛异常。
+    因此改用自定义 AsyncBaseTransport 按路径主动抛 httpx.InvalidURL。
+    """
+    cfg = _make_cfg(max_concurrency=2)
+    urls = [f"https://a.example/bad{i}" for i in range(8)] + ["https://a.example/ok"]
+    client = httpx.AsyncClient(transport=_InvalidURLTransport())
+    try:
+        stats = await asyncio.wait_for(
+            crawl(
+                cfg,
+                urls,
+                RunOptions(),
+                clock=FakeClock(),
+                client=client,
+                writer=_ListWriter(),
+                progress=NullProgress(),
+            ),
+            timeout=5.0,
+        )
+    finally:
+        await client.aclose()
+    # /bad* 抛 InvalidURL → fetch 捕获后 should_retry(status_code=None, exc) 判定可重试，
+    # 但 max_retries=0 使 attempt=1 已达上限，重试耗尽 → status="failed"、
+    # error="network/InvalidURL"。
+    # robots 放行、无 skipped；唯一正常 URL 仍 ok。
+    assert stats.ok == 1
+    assert stats.failed == 8
+    assert stats.ok + stats.failed + stats.skipped == 9
+
+
+# ---------- 13. 装配失败时自建 client 被关闭 ----------
+
+
+async def test_own_client_closed_when_plan_compile_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    """plan 编译抛 ConfigError 时，crawl 自建的 client 必须在 finally 中被关闭。"""
+    closed = False
+    real_build_client = build_client
+
+    def patched_build_client(cfg: AppConfig, *, user_agent: str) -> httpx.AsyncClient:
+        nonlocal closed
+        client = real_build_client(cfg, user_agent=user_agent)
+        real_aclose = client.aclose
+
+        async def tracking_aclose() -> None:
+            nonlocal closed
+            closed = True
+            await real_aclose()
+
+        client.aclose = tracking_aclose  # type: ignore[method-assign]
+        return client
+
+    monkeypatch.setattr("myscraper.runner.build_client", patched_build_client)
+
+    cfg = _make_cfg().model_copy(
+        update={"extract": ExtractSettings(selectors={"title": {"selector": ">>"}})}
+    )
+    with pytest.raises(ConfigError):
+        await crawl(cfg, ["https://a.example/"], RunOptions())
+    assert closed is True

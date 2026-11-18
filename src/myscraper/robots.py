@@ -183,8 +183,9 @@ class RobotsCache:
         """拉取并解析 origin 的 robots.txt，产出 origin 级规则（含保守降级）。"""
         try:
             resp = await self._client.get(origin + ROBOTS_PATH)
-        except httpx.HTTPError:
+        except (httpx.HTTPError, httpx.InvalidURL):
             # 保守：拉不到 robots.txt 就整 host 跳过，绝不静默放行。
+            # InvalidURL 不继承 HTTPError（构造 Request 时同步抛出），须显式捕获。
             return _OriginRules(parser=None, source="unreachable", crawl_delay_s=None, blocked=True)
 
         if resp.status_code == 200:

@@ -179,3 +179,47 @@ def test_crawl_exception_exit_code_is_five(tmp_path: Path, monkeypatch: pytest.M
     """crawl 抛未预期异常时返回 5（内部错误）。"""
     _install_fake_crawl(monkeypatch, RuntimeError("boom"))
     assert main(["--urls", str(_write_url_file(tmp_path))]) == 5
+
+
+def test_write_errors_exit_five(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """写出失败时返回退出码 5，并在 stderr 提示写出失败。"""
+    _install_fake_crawl(
+        monkeypatch,
+        CrawlStats(total=1, ok=1, failed=0, skipped=0, write_errors=2),
+    )
+    assert main(["--urls", str(_write_url_file(tmp_path))]) == 5
+    assert "写出失败" in capsys.readouterr().err
+
+
+def test_config_file_format_is_used(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """YAML 配置文件的 output.format 生效并传给 crawl。"""
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text("output:\n  format: csv\n", encoding="utf-8")
+    seen: list[RunOptions] = []
+
+    async def fake_crawl(
+        cfg: AppConfig,
+        urls: Sequence[str],
+        options: RunOptions,
+        **kwargs: object,
+    ) -> CrawlStats:
+        del cfg, urls, kwargs
+        seen.append(options)
+        return CrawlStats(total=1, ok=1, failed=0, skipped=0)
+
+    monkeypatch.setattr(cli_module, "crawl", fake_crawl)
+    assert main(["--config", str(config_file), "--urls", str(_write_url_file(tmp_path))]) == 0
+    assert seen[0].fmt == "csv"
+
+
+def test_all_skipped_exit_zero(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """全部因 robots 合规跳过时返回退出码 0。"""
+    _install_fake_crawl(
+        monkeypatch,
+        CrawlStats(total=0, ok=0, failed=0, skipped=3),
+    )
+    assert main(["--urls", str(_write_url_file(tmp_path))]) == 0
