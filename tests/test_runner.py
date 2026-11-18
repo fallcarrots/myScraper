@@ -377,3 +377,64 @@ def test_runner_source_forbids_semaphore() -> None:
     """用例 9：源码红线——runner.py 不得出现 Semaphore(（worker 池即并发上限）。"""
     text = RUNNER_SOURCE.read_text(encoding="utf-8")
     assert "Semaphore(" not in text
+
+
+# ---------- 10. 全局 QPS 兜底生效 ----------
+
+
+async def test_global_rate_limit_bottleneck() -> None:
+    """全局 1 rps：4 个不同 host 的请求，虚拟时间至少推进 3.0s。"""
+    cfg = default_config().model_copy(
+        update={
+            "max_concurrency": 2,
+            "rate_limit": RateLimitSettings(
+                rate_limit_per_host=1000.0,
+                min_request_interval=0.0,
+                global_rate_limit=1.0,
+            ),
+            "retry": RetrySettings(max_retries=0),
+        }
+    )
+    clock = FakeClock()
+    writer = _ListWriter()
+    client = _make_client(_wrap_robots(lambda _req: httpx.Response(200, text=PAGE_HTML)))
+    try:
+        stats = await crawl(
+            cfg,
+            [f"https://h{i}.example/p" for i in range(4)],
+            RunOptions(),
+            clock=clock,
+            client=client,
+            writer=writer,
+            progress=NullProgress(),
+        )
+    finally:
+        await client.aclose()
+    assert stats.ok == 4
+    assert clock.monotonic() >= 3.0
+
+
+# ---------- 11. worker 数不随 host 数变化 ----------
+
+
+async def test_worker_count_independent_of_host_count() -> None:
+    """20 个不同 host、max_concurrency=2 → 在途峰值不超过 2。"""
+    cfg = _make_cfg(max_concurrency=2)
+    counter = _InFlight()
+    clock = FakeClock()
+    writer = _ListWriter()
+    client = httpx.AsyncClient(transport=_CountingTransport(counter))
+    try:
+        stats = await crawl(
+            cfg,
+            [f"https://h{i}.example/p" for i in range(20)],
+            RunOptions(),
+            clock=clock,
+            client=client,
+            writer=writer,
+            progress=NullProgress(),
+        )
+    finally:
+        await client.aclose()
+    assert stats.ok == 20
+    assert counter.peak <= 2, f"在途请求峰值 {counter.peak} 超过并发上限 2"

@@ -154,10 +154,12 @@ async def _run_crawl(
     clk: Clock = clock if clock is not None else SystemClock()
     own_client = client is None
     http = client if client is not None else build_client(cfg, user_agent=user_agent)
+    # 全局速率兜底与 per-host 限速在同一把锁内以 max() 复合，worker 数与 host 数解耦。
     limiter = HostRateLimiter(
         clk,
         rate_limit_per_host=cfg.rate_limit.rate_limit_per_host,
         min_request_interval=cfg.rate_limit.min_request_interval,
+        global_rate_limit=cfg.rate_limit.global_rate_limit,
     )
     policy = RetryPolicy(
         max_retries=cfg.retry.max_retries,

@@ -116,3 +116,22 @@ def test_missing_path_raises(tmp_path: Path) -> None:
     """不存在的配置文件路径抛 ConfigError。"""
     with pytest.raises(ConfigError):
         load_config(tmp_path / "no-such-file.yaml")
+
+
+# --- 全局速率兜底 ---
+
+
+def test_global_rate_limit_default_and_bounds() -> None:
+    """默认值 10.0；边界 65/0 抛 ValidationError，64 通过。"""
+    assert AppConfig().rate_limit.global_rate_limit == 10.0
+    for bad in (65, 0):
+        with pytest.raises(ValidationError):
+            AppConfig.model_validate({"rate_limit": {"global_rate_limit": bad}})
+    cfg = AppConfig.model_validate({"rate_limit": {"global_rate_limit": 64}})
+    assert cfg.rate_limit.global_rate_limit == 64.0
+
+
+def test_env_global_rate_limit() -> None:
+    """白名单环境变量正确覆盖全局速率默认值。"""
+    cfg = load_config(env={"MYSCRAPER_GLOBAL_RATE_LIMIT": "4"})
+    assert cfg.rate_limit.global_rate_limit == 4.0

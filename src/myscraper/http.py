@@ -16,7 +16,7 @@ import httpx
 
 from .clock import Clock
 from .config import AppConfig
-from .ratelimit import HostRateLimiter, compute_interval
+from .ratelimit import HostRateLimiter
 from .retry import RetryPolicy, parse_retry_after, should_retry
 from .robots import RobotsCache
 
@@ -100,12 +100,12 @@ class HttpFetcher:
 
     流程严格按序执行：
     1. robots 判定，不允许即返回 ``skipped``；
-    2. 由全项目唯一限速公式 `compute_interval` 算出间隔；
-    3. 逐次尝试（最多 ``max_retries + 1`` 次），**每次尝试都重新 acquire 令牌**；
-    4. 网络异常与可重试状态码按 `RetryPolicy` 退避（经注入 `Clock` 睡眠，
+    2. 逐次尝试（最多 ``max_retries + 1`` 次），**每次尝试都重新 acquire 令牌**，
+       并向限速器透传 robots 的 ``crawl_delay``（秒），间隔公式由限速器内部统一计算；
+    3. 网络异常与可重试状态码按 `RetryPolicy` 退避（经注入 `Clock` 睡眠，
        绝不直接 ``asyncio.sleep``，也不使用 ``AsyncHTTPTransport(retries=)``）；
-    5. 2xx 成功时限长读取响应体，并复核重定向终点的 robots 合规；
-    6. 循环耗尽后返回最后一次失败的 `FetchOutcome`。
+    4. 2xx 成功时限长读取响应体，并复核重定向终点的 robots 合规；
+    5. 循环耗尽后返回最后一次失败的 `FetchOutcome`。
     """
 
     def __init__(
@@ -164,23 +164,17 @@ class HttpFetcher:
                 final_url=url,
             )
 
-        # 2) 全项目唯一限速公式：三者的最大值作为两次请求的最小间隔。
-        interval = compute_interval(
-            rate_limit_per_host=self._rate_limit_per_host,
-            min_request_interval=self._min_request_interval,
-            crawl_delay=verdict.crawl_delay_s,
-        )
-
         last_outcome: FetchOutcome | None = None
 
-        # 3) 逐次尝试：首次 + 最多 max_retries 次重试；每次尝试都重新取令牌。
+        # 2) 逐次尝试：首次 + 最多 max_retries 次重试；每次尝试都重新取令牌。
+        #    host 步长由限速器内部统一计算，这里只透传 robots 的 crawl_delay（秒）。
         for attempt in range(1, self._policy.max_retries + 2):
-            await self._limiter.acquire(host, interval)
+            await self._limiter.acquire(host, crawl_delay=verdict.crawl_delay_s)
 
             try:
                 resp = await self._client.get(url)
             except httpx.HTTPError as exc:
-                # 3a) 网络层失败：可重试则按策略退避后继续，否则终局失败。
+                # 2a) 网络层失败：可重试则按策略退避后继续，否则终局失败。
                 if should_retry(
                     "GET",
                     status_code=None,
@@ -208,7 +202,7 @@ class HttpFetcher:
                 )
 
             if 200 <= resp.status_code < 300:
-                # 3b) 成功：限长读取响应体。
+                # 2b) 成功：限长读取响应体。
                 text, truncated = await read_capped(resp, self._max_html_bytes)
                 # 重定向终点再复核一次 robots 合规。
                 final_url = str(resp.url)
@@ -235,7 +229,7 @@ class HttpFetcher:
                     attempts=attempt,
                 )
 
-            # 3c) 可重试状态码：按 Retry-After（若有）或指数退避等待后继续。
+            # 2c) 可重试状态码：按 Retry-After（若有）或指数退避等待后继续。
             if should_retry(
                 "GET",
                 status_code=resp.status_code,
@@ -257,7 +251,7 @@ class HttpFetcher:
                 await self._clock.sleep(self._policy.delay_for(attempt, retry_after_s=retry_after))
                 continue
 
-            # 3d) 不可重试的状态码：终局失败。
+            # 2d) 不可重试的状态码：终局失败。
             return FetchOutcome(
                 status="failed",
                 error=f"http/{resp.status_code}",
@@ -267,7 +261,7 @@ class HttpFetcher:
                 attempts=attempt,
             )
 
-        # 4) 循环耗尽：兜底返回最后一次失败快照。
+        # 3) 循环耗尽：兜底返回最后一次失败快照。
         if last_outcome is None:
             return FetchOutcome(
                 status="failed",

@@ -20,7 +20,7 @@ import typer
 from pydantic import ValidationError
 
 from . import __version__
-from .config import build_user_agent, load_config
+from .config import AppConfig, build_user_agent, load_config
 from .errors import ConfigError, InputError
 from .exitcodes import ExitCode, decide_exit_code
 from .input import load_urls
@@ -59,15 +59,19 @@ def crawl_cmd(
         if concurrency is not None:
             updates["max_concurrency"] = concurrency
         if rate_limit is not None:
-            updates["rate_limit"] = cfg.rate_limit.model_copy(
-                update={"rate_limit_per_host": rate_limit}
-            )
+            updates["rate_limit"] = {
+                **cfg.rate_limit.model_dump(),
+                "rate_limit_per_host": rate_limit,
+            }
         if max_retries is not None:
-            updates["retry"] = cfg.retry.model_copy(update={"max_retries": max_retries})
+            updates["retry"] = {**cfg.retry.model_dump(), "max_retries": max_retries}
         if fmt is not None:
-            updates["output"] = cfg.output.model_copy(update={"format": fmt})
+            updates["output"] = {**cfg.output.model_dump(), "format": fmt}
         if updates:
-            cfg = cfg.model_copy(update=updates)
+            # 合并普通 dict 后重新校验：model_copy(update=...) 不校验，会绕过 Literal/le 约束。
+            merged: dict[str, object] = cfg.model_dump()
+            merged.update(updates)
+            cfg = AppConfig.model_validate(merged)
     except ValidationError as exc:
         raise typer.Exit(_config_error_exit(f"配置校验失败: {exc}")) from exc
     except ConfigError as exc:

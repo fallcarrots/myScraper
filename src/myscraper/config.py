@@ -26,6 +26,10 @@ MAX_CONCURRENCY_HARD_CAP: int = 64
 DEFAULT_RATE_LIMIT_PER_HOST: float = 1.0
 #: 同主机两次请求之间的最小间隔秒数。
 DEFAULT_MIN_REQUEST_INTERVAL: float = 0.5
+#: 全局每秒请求数兜底上限（所有 host 合计），防止多 host 场景下聚合压力放大。
+DEFAULT_GLOBAL_RATE_LIMIT: float = 10.0
+#: 全局速率硬上限，与并发硬顶同量级。
+MAX_GLOBAL_RATE_LIMIT: float = 64.0
 
 
 class HttpSettings(BaseModel):
@@ -50,6 +54,10 @@ class RateLimitSettings(BaseModel):
     rate_limit_per_host: float = Field(default=DEFAULT_RATE_LIMIT_PER_HOST, gt=0)
     #: 同主机两次请求之间的最小间隔秒数。
     min_request_interval: float = Field(default=DEFAULT_MIN_REQUEST_INTERVAL, ge=0)
+    #: 全局每秒请求数上限（所有 host 合计）。
+    global_rate_limit: float = Field(
+        default=DEFAULT_GLOBAL_RATE_LIMIT, gt=0, le=MAX_GLOBAL_RATE_LIMIT
+    )
 
 
 class RetrySettings(BaseModel):
@@ -158,12 +166,14 @@ def build_user_agent(version: str, project_url: str) -> str:
 
 
 __all__ = [
+    "DEFAULT_GLOBAL_RATE_LIMIT",
     "DEFAULT_MAX_CONCURRENCY",
     "DEFAULT_MIN_REQUEST_INTERVAL",
     "DEFAULT_RATE_LIMIT_PER_HOST",
     "ENV_MAP",
     "ENV_PREFIX",
     "MAX_CONCURRENCY_HARD_CAP",
+    "MAX_GLOBAL_RATE_LIMIT",
     "AppConfig",
     "ExtractSettings",
     "HttpSettings",
@@ -218,6 +228,7 @@ ENV_MAP: Final[dict[str, tuple[str, type[int] | type[float] | type[str]]]] = {
     "MYSCRAPER_MAX_CONCURRENCY": ("max_concurrency", int),
     "MYSCRAPER_RATE_LIMIT_PER_HOST": ("rate_limit.rate_limit_per_host", float),
     "MYSCRAPER_MIN_REQUEST_INTERVAL": ("rate_limit.min_request_interval", float),
+    "MYSCRAPER_GLOBAL_RATE_LIMIT": ("rate_limit.global_rate_limit", float),
     "MYSCRAPER_CONNECT_TIMEOUT_S": ("http.connect_timeout_s", float),
     "MYSCRAPER_READ_TIMEOUT_S": ("http.read_timeout_s", float),
     "MYSCRAPER_MAX_HTML_BYTES": ("http.max_html_bytes", int),

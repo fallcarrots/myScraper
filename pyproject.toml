@@ -100,7 +100,7 @@ branch = true
 source = ["myscraper"]
 
 [tool.coverage.report]
-fail_under = 60
+fail_under = 90
 show_missing = true
 skip_covered = true
 exclude_lines = ["pragma: no cover", "if TYPE_CHECKING:", "raise NotImplementedError"]
