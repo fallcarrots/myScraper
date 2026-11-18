@@ -7,13 +7,13 @@
 from __future__ import annotations
 
 import ast
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable, Iterator
 from pathlib import Path
 
 import httpx
 from fakes import FakeClock
 
-from myscraper.config import AppConfig, HttpSettings, default_config
+from myscraper.config import AppConfig, HttpSettings, RetrySettings, default_config
 from myscraper.http import HttpFetcher, build_client
 from myscraper.ratelimit import HostRateLimiter
 from myscraper.retry import RetryPolicy
@@ -35,13 +35,19 @@ def _make_fetcher(
     rate_limit_per_host: float = 10.0,
     min_request_interval: float = 0.0,
     max_html_bytes: int = 5242880,
+    transport: httpx.AsyncBaseTransport | None = None,
 ) -> tuple[HttpFetcher, httpx.AsyncClient, FakeClock]:
-    """用 MockTransport 客户端 + FakeClock 组装 HttpFetcher（robots 共用同一客户端）。"""
+    """用 MockTransport 客户端 + FakeClock 组装 HttpFetcher（robots 共用同一客户端）。
+
+    ``transport`` 非空时改用它（用于注入自定义传输层，如限长读取回归测试）。
+    """
     clock = FakeClock()
     policy = RetryPolicy(max_retries=max_retries, base_backoff_s=0.5, max_backoff_s=30.0)
     # follow_redirects=True 与 build_client 行为对齐（重定向由客户端跟随）。
     client = httpx.AsyncClient(
-        transport=httpx.MockTransport(handler), follow_redirects=True, max_redirects=5
+        transport=transport if transport is not None else httpx.MockTransport(handler),
+        follow_redirects=True,
+        max_redirects=5,
     )
     robots = RobotsCache(client, clock)
     limiter = HostRateLimiter(
@@ -343,3 +349,78 @@ def test_http_source_has_no_forbidden_constructs() -> None:
 
     assert "asyncio.sleep" not in calls
     assert not any("AsyncHTTPTransport" in name for name in calls)
+
+
+# ---------- 14. InvalidURL 确定性错误不重试 ----------
+
+
+async def test_invalid_url_is_not_retried() -> None:
+    """InvalidURL 属确定性错误：不得重试、不得产生退避等待。"""
+    cfg: AppConfig = default_config().model_copy(update={"retry": RetrySettings(max_retries=3)})
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/robots.txt":
+            return httpx.Response(200, text="User-agent: *\nAllow: /\n")
+        raise httpx.InvalidURL("bad url")
+
+    fetcher, client, clock = _make_fetcher(handler, max_retries=cfg.retry.max_retries)
+    async with client:
+        outcome = await fetcher.fetch(TARGET_URL)
+    assert outcome.status == "failed"
+    assert "InvalidURL" in (outcome.error or "")
+    assert clock.sleeps == []
+    assert outcome.attempts == 1
+
+
+# ---------- 15. R-2 回归：超大响应提前停止读取 ----------
+
+
+async def test_oversized_response_stops_reading_early() -> None:
+    """超过 max_html_bytes 时必须提前停止读取，而不是先全量下载再截断。"""
+
+    # httpx 不接受同步生成器作为 content=（会得到仅同步的 IteratorByteStream，
+    # 而 read_capped 走 resp.aiter_bytes() 要求 AsyncByteStream），故自定义 AsyncByteStream。
+    class _CountingStream(httpx.AsyncByteStream):
+        def __init__(self, gen: Iterator[bytes]) -> None:
+            self._gen = gen
+
+        async def __aiter__(self) -> AsyncIterator[bytes]:
+            for chunk in self._gen:
+                yield chunk
+
+    class _CountingStreamTransport(httpx.AsyncBaseTransport):
+        def __init__(self) -> None:
+            super().__init__()
+            self.chunks_consumed = 0
+
+        def _gen(self) -> Iterator[bytes]:
+            for _ in range(100):
+                self.chunks_consumed += 1
+                yield b"x" * (100 * 1024)
+
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/robots.txt":
+                return httpx.Response(200, text="User-agent: *\nAllow: /\n")
+            return httpx.Response(
+                200,
+                stream=_CountingStream(self._gen()),
+                headers={"content-type": "text/html"},
+            )
+
+    cfg: AppConfig = default_config().model_copy(
+        update={"http": HttpSettings(max_html_bytes=1024 * 1024)}
+    )
+    transport = _CountingStreamTransport()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text=PAGE_TEXT)
+
+    fetcher, client, _ = _make_fetcher(
+        handler, max_html_bytes=cfg.http.max_html_bytes, transport=transport
+    )
+    async with client:
+        outcome = await fetcher.fetch(TARGET_URL)
+
+    assert outcome.truncated is True
+    assert len(outcome.text.encode()) <= 1024 * 1024
+    assert transport.chunks_consumed < 100

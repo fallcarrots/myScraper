@@ -22,6 +22,7 @@ import httpx
 from .clock import Clock
 
 __all__ = [
+    "MAX_ROBOTS_BYTES",
     "PRODUCT_TOKEN",
     "ROBOTS_PATH",
     "RobotsCache",
@@ -36,6 +37,8 @@ __all__ = [
 PRODUCT_TOKEN: Final[str] = "myscraper"  # noqa: S105 —— UA 产品标识，非凭据
 #: 每个 origin 的 robots.txt 标准路径。
 ROBOTS_PATH: Final[str] = "/robots.txt"
+#: robots.txt 解析上限（RFC 9309 §2.2.1 要求至少支持 500 KiB）。
+MAX_ROBOTS_BYTES: Final[int] = 512 * 1024
 
 #: 裁决来源：
 #: - ``robots``：成功拉取并解析了 robots.txt；
@@ -180,23 +183,38 @@ class RobotsCache:
         )
 
     async def _fetch_rules(self, origin: str) -> _OriginRules:
-        """拉取并解析 origin 的 robots.txt，产出 origin 级规则（含保守降级）。"""
+        """拉取并解析 origin 的 robots.txt，产出 origin 级规则（含保守降级）。
+
+        流式读取并以 `MAX_ROBOTS_BYTES` 截断，防止超大 robots.txt 全量缓冲导致 OOM。
+        """
+        # 局部导入以避免 http↔robots 循环依赖（http.py 顶部 import 了 RobotsCache）。
+        from .http import read_capped
+
         try:
-            resp = await self._client.get(origin + ROBOTS_PATH)
+            request = self._client.build_request("GET", origin + ROBOTS_PATH)
+            response = await self._client.send(request, stream=True)
+            try:
+                status = response.status_code
+                if status == 200:
+                    text, _ = await read_capped(response, MAX_ROBOTS_BYTES)
+                else:
+                    text = ""
+            finally:
+                await response.aclose()
         except (httpx.HTTPError, httpx.InvalidURL):
             # 保守：拉不到 robots.txt 就整 host 跳过，绝不静默放行。
             # InvalidURL 不继承 HTTPError（构造 Request 时同步抛出），须显式捕获。
             return _OriginRules(parser=None, source="unreachable", crawl_delay_s=None, blocked=True)
 
-        if resp.status_code == 200:
-            parser = build_parser(resp.text)
+        if status == 200:
+            parser = build_parser(text)
             delay = crawl_delay_of(parser)
             if delay is not None and delay > self._max_crawl_delay_s:
                 return _OriginRules(
                     parser=parser, source="robots", crawl_delay_s=delay, blocked=True
                 )
             return _OriginRules(parser=parser, source="robots", crawl_delay_s=delay, blocked=False)
-        if 400 <= resp.status_code < 500:
+        if 400 <= status < 500:
             # RFC 9309：4xx（含 404）视为无 robots.txt 限制，允许抓取。
             return _OriginRules(parser=None, source="absent", crawl_delay_s=None, blocked=False)
         # 5xx 及其他状态码：保守判为不可抓。

@@ -58,17 +58,19 @@ class FetchOutcome:
 
 def build_client(cfg: AppConfig, *, user_agent: str) -> httpx.AsyncClient:
     """按配置构造异步 HTTP 客户端（仅设置 User-Agent，无其他自定义头）。"""
+    pool = max(8, cfg.max_concurrency) + 8  # 留余量：robots.txt 与重定向共用同一池
     timeout = httpx.Timeout(
         connect=cfg.http.connect_timeout_s,
         read=cfg.http.read_timeout_s,
         write=cfg.http.read_timeout_s,
-        pool=cfg.http.connect_timeout_s,
+        pool=min(cfg.http.connect_timeout_s, 5.0),  # 池等待应快速失败并交给退避
     )
     return httpx.AsyncClient(
         timeout=timeout,
         follow_redirects=True,
         max_redirects=5,
         headers={"User-Agent": user_agent},
+        limits=httpx.Limits(max_connections=pool, max_keepalive_connections=pool),
     )
 
 
@@ -141,6 +143,29 @@ class HttpFetcher:
         self._min_request_interval = min_request_interval
         self._max_html_bytes = max_html_bytes
 
+    async def _get_streamed(self, url: str) -> tuple[int, str, str, bool, str | None]:
+        """流式单次请求：读取受 max_html_bytes 限制，超限即截断。
+
+        返回 ``(状态码, 最终 URL, 文本, 是否截断, Retry-After 头原值)``；
+        非 2xx 不读取响应体（text 为空），Retry-After 头供上层退避决策使用。
+        """
+        request = self._client.build_request("GET", url)
+        response = await self._client.send(request, stream=True)
+        try:
+            if 200 <= response.status_code < 300:
+                text, truncated = await read_capped(response, self._max_html_bytes)
+            else:
+                text, truncated = "", False
+            return (
+                response.status_code,
+                str(response.url),
+                text,
+                truncated,
+                response.headers.get("Retry-After"),
+            )
+        finally:
+            await response.aclose()  # 必须显式释放，否则连接池泄漏
+
     async def fetch(self, url: str) -> FetchOutcome:
         """抓取单个 URL，返回 `FetchOutcome`（绝不抛出网络/robots 异常，含 InvalidURL）。
 
@@ -172,10 +197,21 @@ class HttpFetcher:
             await self._limiter.acquire(host, crawl_delay=verdict.crawl_delay_s)
 
             try:
-                resp = await self._client.get(url)
-            except (httpx.HTTPError, httpx.InvalidURL) as exc:
-                # 2a) 网络层失败（含构造 Request 时同步抛出的 InvalidURL，
-                #     它不继承 HTTPError）：可重试则按策略退避后继续，否则终局失败。
+                status, final_url, text, truncated, retry_after_header = await self._get_streamed(
+                    url
+                )
+            except httpx.InvalidURL as exc:
+                # 确定性错误：URL 构造失败，重试必然再失败，且会污染限速令牌。
+                return FetchOutcome(
+                    status="failed",
+                    error=f"network/{type(exc).__name__}",
+                    status_code=0,
+                    url=url,
+                    final_url=url,
+                    attempts=attempt,
+                )
+            except httpx.HTTPError as exc:
+                # 2a) 网络层失败：可重试则按策略退避后继续，否则终局失败。
                 if should_retry(
                     "GET",
                     status_code=None,
@@ -202,18 +238,16 @@ class HttpFetcher:
                     attempts=attempt,
                 )
 
-            if 200 <= resp.status_code < 300:
-                # 2b) 成功：限长读取响应体。
-                text, truncated = await read_capped(resp, self._max_html_bytes)
+            if 200 <= status < 300:
+                # 2b) 成功：响应体已在 _get_streamed 中限长读取。
                 # 重定向终点再复核一次 robots 合规。
-                final_url = str(resp.url)
                 if final_url != url:
                     redirect_verdict = await self._robots.verdict_for(final_url)
                     if not redirect_verdict.allowed:
                         return FetchOutcome(
                             status="skipped",
                             skip_reason="robots/redirect_disallowed",
-                            status_code=resp.status_code,
+                            status_code=status,
                             url=url,
                             final_url=final_url,
                             text=text,
@@ -222,7 +256,7 @@ class HttpFetcher:
                         )
                 return FetchOutcome(
                     status="ok",
-                    status_code=resp.status_code,
+                    status_code=status,
                     url=url,
                     final_url=final_url,
                     text=text,
@@ -233,20 +267,18 @@ class HttpFetcher:
             # 2c) 可重试状态码：按 Retry-After（若有）或指数退避等待后继续。
             if should_retry(
                 "GET",
-                status_code=resp.status_code,
+                status_code=status,
                 attempt=attempt,
                 exc=None,
                 max_retries=self._policy.max_retries,
             ):
-                retry_after = parse_retry_after(
-                    resp.headers.get("Retry-After"), now=self._clock.now()
-                )
+                retry_after = parse_retry_after(retry_after_header, now=self._clock.now())
                 last_outcome = FetchOutcome(
                     status="failed",
-                    error=f"http/{resp.status_code}",
-                    status_code=resp.status_code,
+                    error=f"http/{status}",
+                    status_code=status,
                     url=url,
-                    final_url=str(resp.url),
+                    final_url=final_url,
                     attempts=attempt,
                 )
                 await self._clock.sleep(self._policy.delay_for(attempt, retry_after_s=retry_after))
@@ -255,10 +287,10 @@ class HttpFetcher:
             # 2d) 不可重试的状态码：终局失败。
             return FetchOutcome(
                 status="failed",
-                error=f"http/{resp.status_code}",
-                status_code=resp.status_code,
+                error=f"http/{status}",
+                status_code=status,
                 url=url,
-                final_url=str(resp.url),
+                final_url=final_url,
                 attempts=attempt,
             )
 
