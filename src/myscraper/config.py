@@ -168,9 +168,16 @@ class AppConfig(BaseModel):
             return data
         merged: dict[str, object] = dict(data)
         rate_limit = merged.get("rate_limit")
-        rl: dict[str, object] = dict(rate_limit) if isinstance(rate_limit, dict) else {}
-        if "global_rate_limit" in rl:
-            return merged  # 显式提供 → 原样交给字段校验
+        rl: dict[str, object] = {}
+        explicit = False
+        if isinstance(rate_limit, RateLimitSettings):
+            rl.update(rate_limit.model_dump())
+            explicit = "global_rate_limit" in rate_limit.model_fields_set
+        elif isinstance(rate_limit, dict):
+            rl.update(rate_limit)
+            explicit = "global_rate_limit" in rate_limit
+        if explicit:
+            return merged
         raw = merged.get("max_concurrency", DEFAULT_MAX_CONCURRENCY)
         if not isinstance(raw, (int, float)) or isinstance(raw, bool):
             return merged

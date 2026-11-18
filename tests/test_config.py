@@ -8,6 +8,7 @@ from pydantic import ValidationError
 
 from myscraper.config import (
     AppConfig,
+    RateLimitSettings,
     build_user_agent,
     load_config,
     load_yaml_file,
@@ -134,4 +135,23 @@ def test_global_rate_limit_default_and_bounds() -> None:
 def test_env_global_rate_limit() -> None:
     """白名单环境变量正确覆盖全局速率默认值。"""
     cfg = load_config(env={"MYSCRAPER_GLOBAL_RATE_LIMIT": "4"})
+    assert cfg.rate_limit.global_rate_limit == 4.0
+
+
+def test_rate_limit_instance_fields_are_preserved() -> None:
+    """传入 RateLimitSettings 实例时，未被覆盖的字段必须保留（不被派生逻辑冲掉）。"""
+    cfg = AppConfig(
+        max_concurrency=32,
+        rate_limit=RateLimitSettings(min_request_interval=5.0),
+    )
+    assert cfg.rate_limit.min_request_interval == 5.0
+    assert cfg.rate_limit.global_rate_limit == 32.0
+
+
+def test_rate_limit_instance_explicit_global_is_respected() -> None:
+    """实例中显式设了 global_rate_limit 时，一律尊重，不按并发数抬升。"""
+    cfg = AppConfig(
+        max_concurrency=32,
+        rate_limit=RateLimitSettings(global_rate_limit=4.0),
+    )
     assert cfg.rate_limit.global_rate_limit == 4.0
