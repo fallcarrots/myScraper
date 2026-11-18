@@ -70,6 +70,8 @@ class CrawlStats:
     skipped: int
     #: 运行是否被取消中断（取消路径下 crawl 会重抛 CancelledError）。
     aborted: bool = False
+    #: 写出失败的记录数（>0 表示输出不完整）。
+    write_errors: int = 0
 
 
 def _to_record(
@@ -153,48 +155,23 @@ async def _run_crawl(
     """装配依赖并运行 worker 池 + 单消费者写协程（writer 已就绪）。"""
     clk: Clock = clock if clock is not None else SystemClock()
     own_client = client is None
-    http = client if client is not None else build_client(cfg, user_agent=user_agent)
-    # 全局速率兜底与 per-host 限速在同一把锁内以 max() 复合，worker 数与 host 数解耦。
-    limiter = HostRateLimiter(
-        clk,
-        rate_limit_per_host=cfg.rate_limit.rate_limit_per_host,
-        min_request_interval=cfg.rate_limit.min_request_interval,
-        global_rate_limit=cfg.rate_limit.global_rate_limit,
-    )
-    policy = RetryPolicy(
-        max_retries=cfg.retry.max_retries,
-        base_backoff_s=cfg.retry.base_backoff_s,
-        max_backoff_s=cfg.retry.max_backoff_s,
-    )
-    robots = RobotsCache(
-        http,
-        clk,
-        ttl_s=cfg.robots.cache_ttl_s,
-        max_crawl_delay_s=cfg.robots.max_crawl_delay_s,
-    )
-    fetcher = HttpFetcher(
-        http,
-        limiter,
-        policy,
-        robots,
-        clk,
-        rate_limit_per_host=cfg.rate_limit.rate_limit_per_host,
-        min_request_interval=cfg.rate_limit.min_request_interval,
-        max_html_bytes=cfg.http.max_html_bytes,
-    )
-    plan: dict[str, ScalarPlan | MultiPlan] | None = (
-        compile_plan(cfg.extract.selectors, max_links=cfg.extract.max_links)
-        if cfg.extract.selectors
-        else None
-    )
+    http: httpx.AsyncClient | None = client
     prog: ProgressReporter = progress if progress is not None else NullProgress()
-    prog.start(len(urls))
 
     work: asyncio.Queue[str | None] = asyncio.Queue(maxsize=cfg.max_concurrency * 2)
     results: asyncio.Queue[PageRecord | None] = asyncio.Queue(maxsize=cfg.max_concurrency * 2)
 
+    # 仅声明绑定：实际构造在 try 内完成（装配失败时 finally 仍能安全收尾）。
+    fetcher: HttpFetcher
+    plan: dict[str, ScalarPlan | MultiPlan] | None
+
     async def worker() -> tuple[int, int, int]:
-        """逐个消费 URL：fetch → 转记录 → 入写队列 → 推进进度；返回本 worker 计数。"""
+        """逐个消费 URL：fetch → 转记录 → 推进度 → 入写队列；返回本 worker 计数。
+
+        逐条异常隔离：单条 URL 的任何异常（含 ``httpx.InvalidURL`` 等非
+        ``HTTPError`` 异常）只记为 failed，不杀死 worker，避免投递循环在
+        满队列上死锁及 ``gather`` fail-fast 整批报废。
+        """
         ok = 0
         failed = 0
         skipped = 0
@@ -202,10 +179,23 @@ async def _run_crawl(
             url = await work.get()
             if url is None:
                 return ok, failed, skipped
-            outcome = await fetcher.fetch(url)
-            record = _to_record(outcome, clk, plan, cfg)
+            try:
+                outcome = await fetcher.fetch(url)
+                record = _to_record(outcome, clk, plan, cfg)
+                prog.advance(record)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.opt(exception=exc).error("worker 处理 URL 失败: {}", url)
+                record = PageRecord(
+                    url=url,
+                    final_url=url,
+                    status_code=0,
+                    fetched_at=clk.now(),
+                    status="failed",
+                    error=f"worker/{type(exc).__name__}",
+                )
             await results.put(record)
-            prog.advance(record)
             if record.status == "ok":
                 ok += 1
             elif record.status == "failed":
@@ -213,31 +203,72 @@ async def _run_crawl(
             else:
                 skipped += 1
 
-    async def writer_loop() -> None:
-        """唯一消费者：串行调用 writer.write，直到收到 None 哨兵。
+    async def writer_loop() -> int:
+        """唯一消费者：串行调用 writer.write，直到收到 None 哨兵；返回写失败数。
 
-        单条写失败仅记日志并丢弃该条，不终止消费循环（避免 worker 因
-        ``results.put`` 永久阻塞造成死锁）。
+        单条写失败仅记日志（前 3 条，避免刷屏）并丢弃该条，不终止消费循环
+        （避免 worker 因 ``results.put`` 永久阻塞造成死锁）；累计错误数交由
+        主协程写入 ``CrawlStats.write_errors``，供退出码判定输出不完整。
         """
+        errors = 0
         while True:
             rec = await results.get()
             if rec is None:
-                return
+                return errors
             try:
                 writer.write(rec)
             except Exception as exc:
-                logger.error("写出记录失败，该条已丢弃: {}", exc)
+                errors += 1
+                if errors <= 3:
+                    logger.error("写出记录失败，该条已丢弃: {}", exc)
 
-    workers: list[asyncio.Task[tuple[int, int, int]]] = [
-        asyncio.create_task(worker(), name=f"myscraper-worker-{i}")
-        for i in range(cfg.max_concurrency)
-    ]
-    writer_task: asyncio.Task[None] = asyncio.create_task(writer_loop(), name="myscraper-writer")
+    workers: list[asyncio.Task[tuple[int, int, int]]] = []
+    writer_task: asyncio.Task[int] = asyncio.create_task(writer_loop(), name="myscraper-writer")
     aborted = False
     ok_total = 0
     failed_total = 0
     skipped_total = 0
+    write_errors = 0
     try:
+        http = client if client is not None else build_client(cfg, user_agent=user_agent)
+        # 全局速率兜底与 per-host 限速在同一把锁内以 max() 复合，worker 数与 host 数解耦。
+        limiter = HostRateLimiter(
+            clk,
+            rate_limit_per_host=cfg.rate_limit.rate_limit_per_host,
+            min_request_interval=cfg.rate_limit.min_request_interval,
+            global_rate_limit=cfg.rate_limit.global_rate_limit,
+        )
+        policy = RetryPolicy(
+            max_retries=cfg.retry.max_retries,
+            base_backoff_s=cfg.retry.base_backoff_s,
+            max_backoff_s=cfg.retry.max_backoff_s,
+        )
+        robots = RobotsCache(
+            http,
+            clk,
+            ttl_s=cfg.robots.cache_ttl_s,
+            max_crawl_delay_s=cfg.robots.max_crawl_delay_s,
+        )
+        fetcher = HttpFetcher(
+            http,
+            limiter,
+            policy,
+            robots,
+            clk,
+            rate_limit_per_host=cfg.rate_limit.rate_limit_per_host,
+            min_request_interval=cfg.rate_limit.min_request_interval,
+            max_html_bytes=cfg.http.max_html_bytes,
+        )
+        plan = (
+            compile_plan(cfg.extract.selectors, max_links=cfg.extract.max_links)
+            if cfg.extract.selectors
+            else None
+        )
+        prog.start(len(urls))
+        workers = [
+            asyncio.create_task(worker(), name=f"myscraper-worker-{i}")
+            for i in range(cfg.max_concurrency)
+        ]
         for url in urls:
             await work.put(url)
         for _ in workers:
@@ -247,7 +278,7 @@ async def _run_crawl(
         failed_total = sum(failed for _ok, failed, _skipped in counts)
         skipped_total = sum(skipped for _ok, _failed, skipped in counts)
         await results.put(None)
-        await writer_task
+        write_errors = await writer_task
     except asyncio.CancelledError:
         aborted = True
         logger.warning("抓取被取消/中断：未完成 URL 丢弃，已入队未写出的记录将丢失")
@@ -258,16 +289,18 @@ async def _run_crawl(
         writer_task.cancel()
         with suppress(asyncio.CancelledError):
             await asyncio.gather(*workers, writer_task, return_exceptions=True)
-        if own_client:
-            with suppress(asyncio.CancelledError):
+        if own_client and http is not None:
+            with suppress(Exception):
                 await http.aclose()
-        prog.close()
+        with suppress(Exception):
+            prog.close()
     return CrawlStats(
         total=ok_total + failed_total,
         ok=ok_total,
         failed=failed_total,
         skipped=skipped_total,
         aborted=aborted,
+        write_errors=write_errors,
     )
 
 
