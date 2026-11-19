@@ -1,3 +1,4 @@
+![CI Status](https://github.com/fallcarrots/myScraper/actions/workflows/ci.yml/badge.svg)
 # myscraper
 
 > ## ⚠️ 免责声明（请先阅读）
